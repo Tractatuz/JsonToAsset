@@ -18,6 +18,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "TaskEvidenceBuilder.h"
 #include "UObject/SavePackage.h"
 #include "UObject/UnrealType.h"
 
@@ -43,6 +44,8 @@ namespace
 			Warnings.Add(Message);
 		}
 	};
+
+	bool ParseRootObject(const FString& JsonString, TSharedPtr<FJsonObject>& OutRoot, FString& OutError);
 
 	FString MakeResultJson(bool bOk, const FString& Error, const FJsonToAssetContext& Context)
 	{
@@ -71,6 +74,75 @@ namespace
 		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonString);
 		FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
 		return JsonString;
+	}
+
+	void WriteJsonToAssetEvidence(const FString& ResultJson, const FString& InputFilePath)
+	{
+		TSharedPtr<FJsonObject> ResultObject;
+		FString ParseError;
+		bool bOk = false;
+		FString Error;
+		int32 ChangeCount = 0;
+		int32 WarningCount = 0;
+
+		if (ParseRootObject(ResultJson, ResultObject, ParseError) && ResultObject.IsValid())
+		{
+			ResultObject->TryGetBoolField(TEXT("ok"), bOk);
+			ResultObject->TryGetStringField(TEXT("error"), Error);
+
+			double NumberValue = 0.0;
+			if (ResultObject->TryGetNumberField(TEXT("change_count"), NumberValue))
+			{
+				ChangeCount = static_cast<int32>(NumberValue);
+			}
+
+			if (ResultObject->TryGetNumberField(TEXT("warning_count"), NumberValue))
+			{
+				WarningCount = static_cast<int32>(NumberValue);
+			}
+		}
+		else
+		{
+			Error = ParseError;
+		}
+
+		FTaskEvidenceBuilder Evidence(TEXT("JsonToAsset"), TEXT("ApplyBlueprintVisualScriptJson"));
+		Evidence
+			.SetStatus(bOk ? TEXT("succeeded") : TEXT("failed"))
+			.SetSummary(bOk ? TEXT("Blueprint visual script JSON applied.") : TEXT("Blueprint visual script JSON apply failed."), Error)
+			.AddFact(TEXT("json_to_asset.ok"), bOk)
+			.AddFact(TEXT("json_to_asset.change_count"), ChangeCount)
+			.AddFact(TEXT("json_to_asset.warning_count"), WarningCount);
+
+		if (!InputFilePath.IsEmpty())
+		{
+			Evidence.AddArtifact(InputFilePath, TEXT("input_patch"), TEXT("application/json"), TEXT("Input JsonToAsset patch JSON."));
+		}
+
+		if (ResultObject.IsValid())
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Changes = nullptr;
+			if (ResultObject->TryGetArrayField(TEXT("changes"), Changes) && Changes)
+			{
+				for (const TSharedPtr<FJsonValue>& Change : *Changes)
+				{
+					Evidence.AddLog(TEXT("info"), TEXT("JsonToAsset"), Change.IsValid() ? Change->AsString() : FString());
+				}
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* Warnings = nullptr;
+			if (ResultObject->TryGetArrayField(TEXT("warnings"), Warnings) && Warnings)
+			{
+				for (const TSharedPtr<FJsonValue>& Warning : *Warnings)
+				{
+					Evidence.AddLog(TEXT("warning"), TEXT("JsonToAsset"), Warning.IsValid() ? Warning->AsString() : FString());
+				}
+			}
+		}
+
+		FString EvidencePath;
+		FString EvidenceError;
+		Evidence.WriteToDefaultLocation(EvidencePath, EvidenceError);
 	}
 
 	FString NormalizeObjectPath(const FString& AssetPath)
@@ -838,17 +910,23 @@ FString UJsonToAssetLibrary::ApplyBlueprintVisualScriptJsonString(
 	FJsonToAssetContext Context;
 	if (JsonString.TrimStartAndEnd().IsEmpty())
 	{
-		return MakeResultJson(false, TEXT("JsonString is empty"), Context);
+		const FString ResultJson = MakeResultJson(false, TEXT("JsonString is empty"), Context);
+		WriteJsonToAssetEvidence(ResultJson, FString());
+		return ResultJson;
 	}
 
 	TSharedPtr<FJsonObject> Root;
 	FString Error;
 	if (!ParseRootObject(JsonString, Root, Error))
 	{
-		return MakeResultJson(false, Error, Context);
+		const FString ResultJson = MakeResultJson(false, Error, Context);
+		WriteJsonToAssetEvidence(ResultJson, FString());
+		return ResultJson;
 	}
 
-	return ApplyBlueprintJsonRoot(Root, bSaveAsset, bCompileBlueprint, bApplyGraphChanges, bAllowStructuralChanges);
+	const FString ResultJson = ApplyBlueprintJsonRoot(Root, bSaveAsset, bCompileBlueprint, bApplyGraphChanges, bAllowStructuralChanges);
+	WriteJsonToAssetEvidence(ResultJson, FString());
+	return ResultJson;
 }
 
 FString UJsonToAssetLibrary::ApplyBlueprintVisualScriptJsonFile(
@@ -861,14 +939,29 @@ FString UJsonToAssetLibrary::ApplyBlueprintVisualScriptJsonFile(
 	FJsonToAssetContext Context;
 	if (JsonFilePath.TrimStartAndEnd().IsEmpty())
 	{
-		return MakeResultJson(false, TEXT("JsonFilePath is empty"), Context);
+		const FString ResultJson = MakeResultJson(false, TEXT("JsonFilePath is empty"), Context);
+		WriteJsonToAssetEvidence(ResultJson, JsonFilePath);
+		return ResultJson;
 	}
 
 	FString JsonString;
 	if (!FFileHelper::LoadFileToString(JsonString, *JsonFilePath))
 	{
-		return MakeResultJson(false, FString::Printf(TEXT("Failed to read JSON file: %s"), *JsonFilePath), Context);
+		const FString ResultJson = MakeResultJson(false, FString::Printf(TEXT("Failed to read JSON file: %s"), *JsonFilePath), Context);
+		WriteJsonToAssetEvidence(ResultJson, JsonFilePath);
+		return ResultJson;
 	}
 
-	return ApplyBlueprintVisualScriptJsonString(JsonString, bSaveAsset, bCompileBlueprint, bApplyGraphChanges, bAllowStructuralChanges);
+	TSharedPtr<FJsonObject> Root;
+	FString Error;
+	if (!ParseRootObject(JsonString, Root, Error))
+	{
+		const FString ResultJson = MakeResultJson(false, Error, Context);
+		WriteJsonToAssetEvidence(ResultJson, JsonFilePath);
+		return ResultJson;
+	}
+
+	const FString ResultJson = ApplyBlueprintJsonRoot(Root, bSaveAsset, bCompileBlueprint, bApplyGraphChanges, bAllowStructuralChanges);
+	WriteJsonToAssetEvidence(ResultJson, JsonFilePath);
+	return ResultJson;
 }

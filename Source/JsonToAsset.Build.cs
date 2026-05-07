@@ -19,6 +19,7 @@ public class JsonToAsset : ModuleRules
 			"Json",
 			"JsonUtilities",
 			"Kismet",
+			"TaskEvidence",
 			"UnrealEd"
 		});
 	}
