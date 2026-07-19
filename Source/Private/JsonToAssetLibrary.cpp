@@ -1,13 +1,35 @@
 #include "JsonToAssetLibrary.h"
 
+#include "Animation/AnimBlueprint.h"
+#include "AnimationStateMachineGraph.h"
+#include "AnimationStateMachineSchema.h"
+#include "AnimationStateGraph.h"
+#include "AnimationStateGraphSchema.h"
+#include "AnimationTransitionGraph.h"
+#include "AnimationTransitionSchema.h"
+#include "AnimGraphNode_StateMachineBase.h"
+#include "AnimStateEntryNode.h"
+#include "AnimStateNode.h"
+#include "AnimStateNodeBase.h"
+#include "AnimStateTransitionNode.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraph/EdGraphSchema.h"
+#include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
+#include "Engine/MemberReference.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "HAL/FileManager.h"
+#include "K2Node.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_CustomEvent.h"
+#include "K2Node_DynamicCast.h"
+#include "K2Node_Event.h"
+#include "K2Node_Variable.h"
+#include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/FileHelper.h"
@@ -181,6 +203,94 @@ namespace
 		return true;
 	}
 
+	bool TryGetStringFieldRecursive(const TSharedPtr<FJsonObject>& JsonObject, const TCHAR* FieldName, FString& OutValue)
+	{
+		return JsonObject.IsValid() && JsonObject->TryGetStringField(FStringView(FieldName), OutValue);
+	}
+
+	bool TryGetStringFieldRecursive(const TSharedPtr<FJsonObject>& JsonObject, const TCHAR* ObjectFieldName, const TCHAR* FieldName, FString& OutValue)
+	{
+		TSharedPtr<FJsonObject> ChildObject;
+		return TryGetObjectField(JsonObject, ObjectFieldName, ChildObject) && TryGetStringFieldRecursive(ChildObject, FieldName, OutValue);
+	}
+
+	bool WantsDelete(const TSharedPtr<FJsonObject>& JsonObject)
+	{
+		if (!JsonObject.IsValid())
+		{
+			return false;
+		}
+
+		bool bDelete = false;
+		if (JsonObject->TryGetBoolField(TEXT("delete"), bDelete) && bDelete)
+		{
+			return true;
+		}
+
+		if (JsonObject->TryGetBoolField(TEXT("remove"), bDelete) && bDelete)
+		{
+			return true;
+		}
+
+		FString Operation;
+		return JsonObject->TryGetStringField(TEXT("operation"), Operation) && Operation.Equals(TEXT("delete"), ESearchCase::IgnoreCase);
+	}
+
+	TSharedPtr<FJsonObject> GetNodeSemanticJson(const TSharedPtr<FJsonObject>& NodeJson)
+	{
+		TSharedPtr<FJsonObject> SemanticJson;
+		TryGetObjectField(NodeJson, TEXT("semantic"), SemanticJson);
+		return SemanticJson;
+	}
+
+	FString GetNodeClassPath(const TSharedPtr<FJsonObject>& NodeJson)
+	{
+		FString ClassPath;
+		if (NodeJson.IsValid())
+		{
+			NodeJson->TryGetStringField(TEXT("class"), ClassPath);
+		}
+
+		if (ClassPath.IsEmpty())
+		{
+			TSharedPtr<FJsonObject> SemanticJson = GetNodeSemanticJson(NodeJson);
+			if (SemanticJson.IsValid())
+			{
+				SemanticJson->TryGetStringField(TEXT("node_class"), ClassPath);
+				if (ClassPath.IsEmpty())
+				{
+					TryGetStringFieldRecursive(SemanticJson, TEXT("anim_graph_node"), TEXT("node_class"), ClassPath);
+				}
+			}
+		}
+
+		return ClassPath;
+	}
+
+	UClass* LoadClassFromJsonPath(const FString& ClassPath, UClass* RequiredBaseClass, FJsonToAssetContext& Context, const FString& Label)
+	{
+		if (ClassPath.IsEmpty())
+		{
+			Context.AddWarning(FString::Printf(TEXT("Missing class path for %s"), *Label));
+			return nullptr;
+		}
+
+		UClass* LoadedClass = LoadObject<UClass>(nullptr, *ClassPath);
+		if (!LoadedClass)
+		{
+			Context.AddWarning(FString::Printf(TEXT("Failed to load class for %s: %s"), *Label, *ClassPath));
+			return nullptr;
+		}
+
+		if (RequiredBaseClass && !LoadedClass->IsChildOf(RequiredBaseClass))
+		{
+			Context.AddWarning(FString::Printf(TEXT("Class for %s is not a %s: %s"), *Label, *RequiredBaseClass->GetName(), *ClassPath));
+			return nullptr;
+		}
+
+		return LoadedClass;
+	}
+
 	FProperty* FindPropertyByName(UClass* Class, const FString& PropertyName)
 	{
 		if (!Class || PropertyName.IsEmpty())
@@ -210,6 +320,49 @@ namespace
 
 		Property->ExportText_InContainer(0, OutValue, Object, nullptr, Object, PPF_None);
 		return true;
+	}
+
+	void ApplyPropertyMap(UObject* Object, const TSharedPtr<FJsonObject>& PropertyMapJson, const FString& ObjectLabel, FJsonToAssetContext& Context)
+	{
+		if (!Object || !PropertyMapJson.IsValid())
+		{
+			return;
+		}
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : PropertyMapJson->Values)
+		{
+			if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::String)
+			{
+				continue;
+			}
+
+			FProperty* Property = FindPropertyByName(Object->GetClass(), Pair.Key);
+			if (!Property)
+			{
+				Context.AddWarning(FString::Printf(TEXT("Property not found on %s: %s"), *ObjectLabel, *Pair.Key));
+				continue;
+			}
+
+			FString OldValue;
+			ExportPropertyValue(Object, Property, OldValue);
+
+			const FString NewValue = Pair.Value->AsString();
+			if (OldValue == NewValue)
+			{
+				continue;
+			}
+
+			Object->Modify();
+			FOutputDeviceNull ErrorOutput;
+			const TCHAR* ImportResult = Property->ImportText_InContainer(*NewValue, Object, Object, PPF_None, &ErrorOutput);
+			if (!ImportResult)
+			{
+				Context.AddWarning(FString::Printf(TEXT("Failed to import %s.%s from value: %s"), *ObjectLabel, *Pair.Key, *NewValue));
+				continue;
+			}
+
+			Context.AddChange(FString::Printf(TEXT("Updated %s.%s"), *ObjectLabel, *Pair.Key));
+		}
 	}
 
 	void ApplyDetailsProperties(UObject* Object, const TSharedPtr<FJsonObject>& DefaultsJson, const FString& ObjectLabel, FJsonToAssetContext& Context)
@@ -506,6 +659,243 @@ namespace
 		return true;
 	}
 
+	void ApplyNodePosition(UEdGraphNode* Node, const TSharedPtr<FJsonObject>& NodeJson)
+	{
+		if (!Node || !NodeJson.IsValid())
+		{
+			return;
+		}
+
+		TSharedPtr<FJsonObject> PositionJson;
+		if (TryGetObjectField(NodeJson, TEXT("position"), PositionJson))
+		{
+			int32 NodePosX = Node->NodePosX;
+			int32 NodePosY = Node->NodePosY;
+			TryGetIntField(PositionJson, TEXT("x"), NodePosX);
+			TryGetIntField(PositionJson, TEXT("y"), NodePosY);
+			Node->NodePosX = NodePosX;
+			Node->NodePosY = NodePosY;
+		}
+	}
+
+	UClass* LoadClassByPath(const FString& ObjectPath)
+	{
+		if (ObjectPath.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		return LoadObject<UClass>(nullptr, *ObjectPath);
+	}
+
+	void ConfigureK2NodeFromSemantic(UBlueprint* Blueprint, UEdGraphNode* Node, const TSharedPtr<FJsonObject>& SemanticJson, FJsonToAssetContext& Context)
+	{
+		if (!Node || !SemanticJson.IsValid())
+		{
+			return;
+		}
+
+		FString Kind;
+		SemanticJson->TryGetStringField(TEXT("kind"), Kind);
+
+		if (UK2Node_CustomEvent* CustomEventNode = Cast<UK2Node_CustomEvent>(Node))
+		{
+			FString CustomFunctionName;
+			if (SemanticJson->TryGetStringField(TEXT("custom_function_name"), CustomFunctionName) || SemanticJson->TryGetStringField(TEXT("function_name"), CustomFunctionName))
+			{
+				CustomEventNode->CustomFunctionName = FName(*CustomFunctionName);
+			}
+		}
+		else if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+		{
+			FString FunctionName;
+			if (SemanticJson->TryGetStringField(TEXT("function_name"), FunctionName))
+			{
+				UClass* OwnerClass = Blueprint ? Blueprint->ParentClass : nullptr;
+				TSharedPtr<FJsonObject> SignatureJson;
+				FString SignatureOwnerClassPath;
+				if (TryGetObjectField(SemanticJson, TEXT("signature_function"), SignatureJson))
+				{
+					SignatureJson->TryGetStringField(TEXT("owner_class"), SignatureOwnerClassPath);
+				}
+
+				if (!SignatureOwnerClassPath.IsEmpty())
+				{
+					OwnerClass = LoadClassByPath(SignatureOwnerClassPath);
+				}
+
+				EventNode->EventReference.SetExternalMember(FName(*FunctionName), OwnerClass);
+			}
+		}
+		else if (UK2Node_CallFunction* CallFunctionNode = Cast<UK2Node_CallFunction>(Node))
+		{
+			TSharedPtr<FJsonObject> TargetFunctionJson;
+			FString FunctionPath;
+			if (TryGetObjectField(SemanticJson, TEXT("target_function"), TargetFunctionJson))
+			{
+				TargetFunctionJson->TryGetStringField(TEXT("path"), FunctionPath);
+			}
+
+			if (UFunction* Function = FunctionPath.IsEmpty() ? nullptr : LoadObject<UFunction>(nullptr, *FunctionPath))
+			{
+				CallFunctionNode->FunctionReference.SetFromField<UFunction>(Function, false);
+			}
+			else
+			{
+				FString FunctionName;
+				SemanticJson->TryGetStringField(TEXT("function_name"), FunctionName);
+				FString OwnerClassPath;
+				if (TargetFunctionJson.IsValid())
+				{
+					TargetFunctionJson->TryGetStringField(TEXT("owner_class"), OwnerClassPath);
+				}
+
+				if (!FunctionName.IsEmpty())
+				{
+					CallFunctionNode->FunctionReference.SetExternalMember(FName(*FunctionName), LoadClassByPath(OwnerClassPath));
+				}
+			}
+		}
+		else if (UK2Node_Variable* VariableNode = Cast<UK2Node_Variable>(Node))
+		{
+			FString VariableName;
+			if (SemanticJson->TryGetStringField(TEXT("variable_name"), VariableName))
+			{
+				FString SourceClassPath;
+				SemanticJson->TryGetStringField(TEXT("variable_source_class"), SourceClassPath);
+				if (UClass* SourceClass = LoadClassByPath(SourceClassPath))
+				{
+					VariableNode->VariableReference.SetExternalMember(FName(*VariableName), SourceClass);
+				}
+				else
+				{
+					VariableNode->VariableReference.SetSelfMember(FName(*VariableName));
+				}
+			}
+		}
+		else if (UK2Node_DynamicCast* DynamicCastNode = Cast<UK2Node_DynamicCast>(Node))
+		{
+			FString TargetTypePath;
+			if (SemanticJson->TryGetStringField(TEXT("target_type"), TargetTypePath))
+			{
+				DynamicCastNode->TargetType = LoadClassByPath(TargetTypePath);
+			}
+		}
+	}
+
+	UEdGraphNode* CreateGraphNodeFromJson(UBlueprint* Blueprint, UEdGraph* Graph, const TSharedPtr<FJsonObject>& NodeJson, FJsonToAssetContext& Context)
+	{
+		if (!Graph || !NodeJson.IsValid())
+		{
+			return nullptr;
+		}
+
+		const FString ClassPath = GetNodeClassPath(NodeJson);
+		UClass* NodeClass = LoadClassFromJsonPath(ClassPath, UEdGraphNode::StaticClass(), Context, FString::Printf(TEXT("node in graph %s"), *Graph->GetName()));
+		if (!NodeClass)
+		{
+			return nullptr;
+		}
+
+		Graph->Modify();
+		UEdGraphNode* Node = NewObject<UEdGraphNode>(Graph, NodeClass, NAME_None, RF_Transactional);
+		if (!Node)
+		{
+			Context.AddWarning(FString::Printf(TEXT("Failed to create node in graph %s from class %s"), *Graph->GetName(), *ClassPath));
+			return nullptr;
+		}
+
+		FString NodeId;
+		NodeJson->TryGetStringField(TEXT("id"), NodeId);
+		const FGuid NodeGuid = ParseGuid(NodeId);
+		Node->NodeGuid = NodeGuid.IsValid() ? NodeGuid : FGuid::NewGuid();
+
+		ApplyNodePosition(Node, NodeJson);
+
+		FString Comment;
+		if (NodeJson->TryGetStringField(TEXT("comment"), Comment))
+		{
+			Node->NodeComment = Comment;
+		}
+
+		TSharedPtr<FJsonObject> SemanticJson = GetNodeSemanticJson(NodeJson);
+		ConfigureK2NodeFromSemantic(Blueprint, Node, SemanticJson, Context);
+
+		TSharedPtr<FJsonObject> PropertiesJson;
+		if (TryGetObjectField(NodeJson, TEXT("properties"), PropertiesJson))
+		{
+			ApplyPropertyMap(Node, PropertiesJson, FString::Printf(TEXT("node %s"), *Node->GetName()), Context);
+		}
+
+		Node->CreateNewGuid();
+		if (NodeGuid.IsValid())
+		{
+			Node->NodeGuid = NodeGuid;
+		}
+
+		Node->PostPlacedNewNode();
+		Node->AllocateDefaultPins();
+		Graph->AddNode(Node, true, false);
+
+		Context.AddChange(FString::Printf(TEXT("Created node %s in graph %s"), *Node->GetName(), *Graph->GetName()));
+		return Node;
+	}
+
+	UEdGraph* CreateGraphFromJson(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& GraphJson, FJsonToAssetContext& Context)
+	{
+		if (!Blueprint || !GraphJson.IsValid())
+		{
+			return nullptr;
+		}
+
+		FString GraphName;
+		GraphJson->TryGetStringField(TEXT("name"), GraphName);
+		if (GraphName.IsEmpty())
+		{
+			Context.AddWarning(TEXT("Cannot create graph without name"));
+			return nullptr;
+		}
+
+		FString SchemaPath;
+		GraphJson->TryGetStringField(TEXT("schema"), SchemaPath);
+		UClass* SchemaClass = SchemaPath.IsEmpty() ? UEdGraphSchema_K2::StaticClass() : LoadClassByPath(SchemaPath);
+		if (!SchemaClass || !SchemaClass->IsChildOf(UEdGraphSchema::StaticClass()))
+		{
+			SchemaClass = UEdGraphSchema_K2::StaticClass();
+		}
+
+		UEdGraph* Graph = FBlueprintEditorUtils::CreateNewGraph(Blueprint, FName(*GraphName), UEdGraph::StaticClass(), SchemaClass);
+		if (!Graph)
+		{
+			Context.AddWarning(FString::Printf(TEXT("Failed to create graph: %s"), *GraphName));
+			return nullptr;
+		}
+
+		FString GraphType;
+		GraphJson->TryGetStringField(TEXT("type"), GraphType);
+		if (GraphType.Equals(TEXT("function"), ESearchCase::IgnoreCase))
+		{
+			FBlueprintEditorUtils::AddFunctionGraph<UFunction>(Blueprint, Graph, true, nullptr);
+		}
+		else if (GraphType.Equals(TEXT("macro"), ESearchCase::IgnoreCase))
+		{
+			FBlueprintEditorUtils::AddMacroGraph(Blueprint, Graph, true, nullptr);
+		}
+		else
+		{
+			FBlueprintEditorUtils::AddUbergraphPage(Blueprint, Graph);
+		}
+
+		const UEdGraphSchema* Schema = Graph->GetSchema();
+		if (Schema && Graph->Nodes.Num() == 0)
+		{
+			Schema->CreateDefaultNodesForGraph(*Graph);
+		}
+
+		Context.AddChange(FString::Printf(TEXT("Created graph %s"), *GraphName));
+		return Graph;
+	}
+
 	void ApplyPinDefaults(UEdGraph* Graph, UEdGraphNode* Node, UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& PinJson, FJsonToAssetContext& Context)
 	{
 		if (!Graph || !Node || !Pin || !PinJson.IsValid())
@@ -574,7 +964,7 @@ namespace
 		}
 	}
 
-	void ApplyGraphNodes(UEdGraph* Graph, const TSharedPtr<FJsonObject>& GraphJson, FJsonToAssetContext& Context)
+	void ApplyGraphNodes(UBlueprint* Blueprint, UEdGraph* Graph, const TSharedPtr<FJsonObject>& GraphJson, bool bAllowStructuralChanges, FJsonToAssetContext& Context)
 	{
 		const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
 		if (!Graph || !GraphJson.IsValid() || !GraphJson->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
@@ -591,12 +981,46 @@ namespace
 			}
 
 			UEdGraphNode* Node = FindNodeByJson(Graph, *NodeJson);
+			if (WantsDelete(*NodeJson))
+			{
+				if (!bAllowStructuralChanges)
+				{
+					Context.AddWarning(FString::Printf(TEXT("Node delete requested without structural changes enabled in graph %s"), *Graph->GetName()));
+					continue;
+				}
+
+				if (Node)
+				{
+					const FString NodeName = Node->GetName();
+					Graph->Modify();
+					Node->Modify();
+					Node->DestroyNode();
+					Context.AddChange(FString::Printf(TEXT("Deleted node %s from graph %s"), *NodeName, *Graph->GetName()));
+				}
+				else
+				{
+					FString NodeName;
+					(*NodeJson)->TryGetStringField(TEXT("name"), NodeName);
+					Context.AddWarning(FString::Printf(TEXT("Node delete target not found in graph %s: %s"), *Graph->GetName(), *NodeName));
+				}
+
+				continue;
+			}
+
 			if (!Node)
 			{
-				FString NodeName;
-				(*NodeJson)->TryGetStringField(TEXT("name"), NodeName);
-				Context.AddWarning(FString::Printf(TEXT("Node not found in graph %s: %s"), *Graph->GetName(), *NodeName));
-				continue;
+				if (bAllowStructuralChanges)
+				{
+					Node = CreateGraphNodeFromJson(Blueprint, Graph, *NodeJson, Context);
+				}
+
+				if (!Node)
+				{
+					FString NodeName;
+					(*NodeJson)->TryGetStringField(TEXT("name"), NodeName);
+					Context.AddWarning(FString::Printf(TEXT("Node not found in graph %s: %s"), *Graph->GetName(), *NodeName));
+					continue;
+				}
 			}
 
 			FString Comment;
@@ -740,7 +1164,484 @@ namespace
 		}
 	}
 
-	void ApplyGraphs(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Root, bool bApplyGraphChanges, FJsonToAssetContext& Context)
+	UAnimationStateMachineGraph* FindAnimationStateMachineGraph(UAnimBlueprint* AnimBlueprint, const FString& StateMachineName)
+	{
+		if (!AnimBlueprint || StateMachineName.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		TArray<UEdGraph*> AllGraphs;
+		AnimBlueprint->GetAllGraphs(AllGraphs);
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			if (!Graph)
+			{
+				continue;
+			}
+
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UAnimGraphNode_StateMachineBase* StateMachineNode = Cast<UAnimGraphNode_StateMachineBase>(Node);
+				if (StateMachineNode && StateMachineNode->EditorStateMachineGraph && StateMachineNode->GetStateMachineName() == StateMachineName)
+				{
+					return StateMachineNode->EditorStateMachineGraph;
+				}
+			}
+		}
+
+		return nullptr;
+	}
+
+	UAnimStateNode* FindAnimStateNode(UAnimationStateMachineGraph* StateMachineGraph, const FString& StateName)
+	{
+		if (!StateMachineGraph || StateName.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : StateMachineGraph->Nodes)
+		{
+			UAnimStateNode* StateNode = Cast<UAnimStateNode>(Node);
+			if (StateNode && StateNode->GetStateName() == StateName)
+			{
+				return StateNode;
+			}
+		}
+
+		return nullptr;
+	}
+
+	UAnimStateTransitionNode* FindAnimTransitionNode(UAnimationStateMachineGraph* StateMachineGraph, const FString& PreviousStateName, const FString& NextStateName)
+	{
+		if (!StateMachineGraph || PreviousStateName.IsEmpty() || NextStateName.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : StateMachineGraph->Nodes)
+		{
+			UAnimStateTransitionNode* TransitionNode = Cast<UAnimStateTransitionNode>(Node);
+			if (!TransitionNode)
+			{
+				continue;
+			}
+
+			const UAnimStateNodeBase* PreviousState = TransitionNode->GetPreviousState();
+			const UAnimStateNodeBase* NextState = TransitionNode->GetNextState();
+			if (PreviousState && NextState && PreviousState->GetStateName() == PreviousStateName && NextState->GetStateName() == NextStateName)
+			{
+				return TransitionNode;
+			}
+		}
+
+		return nullptr;
+	}
+
+	UAnimStateNode* CreateAnimStateNode(UAnimationStateMachineGraph* StateMachineGraph, const TSharedPtr<FJsonObject>& StateJson, FJsonToAssetContext& Context)
+	{
+		if (!StateMachineGraph || !StateJson.IsValid())
+		{
+			return nullptr;
+		}
+
+		FString StateName;
+		StateJson->TryGetStringField(TEXT("name"), StateName);
+		if (StateName.IsEmpty())
+		{
+			Context.AddWarning(FString::Printf(TEXT("State in state machine %s has no name"), *StateMachineGraph->GetName()));
+			return nullptr;
+		}
+
+		UAnimStateNode* StateNode = FindAnimStateNode(StateMachineGraph, StateName);
+		const bool bCreatedState = StateNode == nullptr;
+
+		int32 NodePosX = StateNode ? StateNode->NodePosX : 0;
+		int32 NodePosY = StateNode ? StateNode->NodePosY : 0;
+		TSharedPtr<FJsonObject> PositionJson;
+		const bool bHasPosition = TryGetObjectField(StateJson, TEXT("position"), PositionJson);
+		if (bHasPosition)
+		{
+			TryGetIntField(PositionJson, TEXT("x"), NodePosX);
+			TryGetIntField(PositionJson, TEXT("y"), NodePosY);
+		}
+
+		if (bCreatedState)
+		{
+			StateMachineGraph->Modify();
+			StateNode = FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimStateNode>(
+				StateMachineGraph,
+				NewObject<UAnimStateNode>(),
+				FVector2f(static_cast<float>(NodePosX), static_cast<float>(NodePosY)),
+				false);
+		}
+
+		if (!StateNode)
+		{
+			Context.AddWarning(FString::Printf(TEXT("Failed to create anim state %s in state machine %s"), *StateName, *StateMachineGraph->GetName()));
+			return nullptr;
+		}
+
+		if (bCreatedState && StateNode->BoundGraph)
+		{
+			FBlueprintEditorUtils::RenameGraph(StateNode->BoundGraph, StateName);
+		}
+
+		if (!bCreatedState && bHasPosition && (StateNode->NodePosX != NodePosX || StateNode->NodePosY != NodePosY))
+		{
+			StateNode->Modify();
+			StateNode->NodePosX = NodePosX;
+			StateNode->NodePosY = NodePosY;
+			Context.AddChange(FString::Printf(TEXT("Updated anim state position %s in state machine %s"), *StateName, *StateMachineGraph->GetName()));
+		}
+
+		bool bAlwaysResetOnEntry = false;
+		if (StateJson->TryGetBoolField(TEXT("always_reset_on_entry"), bAlwaysResetOnEntry) && StateNode->bAlwaysResetOnEntry != bAlwaysResetOnEntry)
+		{
+			StateNode->Modify();
+			StateNode->bAlwaysResetOnEntry = bAlwaysResetOnEntry;
+			Context.AddChange(FString::Printf(TEXT("Updated anim state %s always_reset_on_entry"), *StateName));
+		}
+
+		TSharedPtr<FJsonObject> PropertiesJson;
+		if (TryGetObjectField(StateJson, TEXT("properties"), PropertiesJson))
+		{
+			ApplyPropertyMap(StateNode, PropertiesJson, FString::Printf(TEXT("anim state %s"), *StateName), Context);
+		}
+
+		if (bCreatedState)
+		{
+			Context.AddChange(FString::Printf(TEXT("Created anim state %s in state machine %s"), *StateName, *StateMachineGraph->GetName()));
+		}
+		return StateNode;
+	}
+
+	void DeleteAnimTransitionNode(UAnimationStateMachineGraph* StateMachineGraph, UAnimStateTransitionNode* TransitionNode, FJsonToAssetContext& Context)
+	{
+		if (!StateMachineGraph || !TransitionNode)
+		{
+			return;
+		}
+
+		const UAnimStateNodeBase* PreviousState = TransitionNode->GetPreviousState();
+		const UAnimStateNodeBase* NextState = TransitionNode->GetNextState();
+		const FString PreviousStateName = PreviousState ? PreviousState->GetStateName() : FString(TEXT("<unknown>"));
+		const FString NextStateName = NextState ? NextState->GetStateName() : FString(TEXT("<unknown>"));
+
+		StateMachineGraph->Modify();
+		TransitionNode->Modify();
+		TransitionNode->DestroyNode();
+		Context.AddChange(FString::Printf(TEXT("Deleted anim transition %s -> %s in state machine %s"), *PreviousStateName, *NextStateName, *StateMachineGraph->GetName()));
+	}
+
+	void DeleteAnimStateNode(UAnimationStateMachineGraph* StateMachineGraph, UAnimStateNode* StateNode, FJsonToAssetContext& Context)
+	{
+		if (!StateMachineGraph || !StateNode)
+		{
+			return;
+		}
+
+		TArray<UAnimStateTransitionNode*> ConnectedTransitions;
+		StateNode->GetTransitionList(ConnectedTransitions, false);
+		for (UAnimStateTransitionNode* TransitionNode : ConnectedTransitions)
+		{
+			DeleteAnimTransitionNode(StateMachineGraph, TransitionNode, Context);
+		}
+
+		const FString StateName = StateNode->GetStateName();
+		StateMachineGraph->Modify();
+		StateNode->Modify();
+		StateNode->DestroyNode();
+		Context.AddChange(FString::Printf(TEXT("Deleted anim state %s from state machine %s"), *StateName, *StateMachineGraph->GetName()));
+	}
+
+	void ApplyTransitionJson(UAnimStateTransitionNode* TransitionNode, const TSharedPtr<FJsonObject>& TransitionJson, FJsonToAssetContext& Context)
+	{
+		if (!TransitionNode || !TransitionJson.IsValid())
+		{
+			return;
+		}
+
+		bool bTransitionChanged = false;
+		auto ModifyTransition = [&TransitionNode, &bTransitionChanged]()
+		{
+			if (!bTransitionChanged)
+			{
+				TransitionNode->Modify();
+				bTransitionChanged = true;
+			}
+		};
+
+		double NumberValue = 0.0;
+		if (TransitionJson->TryGetNumberField(TEXT("priority_order"), NumberValue))
+		{
+			const int32 NewValue = static_cast<int32>(NumberValue);
+			if (TransitionNode->PriorityOrder != NewValue)
+			{
+				ModifyTransition();
+				TransitionNode->PriorityOrder = NewValue;
+			}
+		}
+		if (TransitionJson->TryGetNumberField(TEXT("crossfade_duration"), NumberValue))
+		{
+			const float NewValue = static_cast<float>(NumberValue);
+			if (TransitionNode->CrossfadeDuration != NewValue)
+			{
+				ModifyTransition();
+				TransitionNode->CrossfadeDuration = NewValue;
+			}
+		}
+		if (TransitionJson->TryGetNumberField(TEXT("automatic_rule_trigger_time"), NumberValue))
+		{
+			const float NewValue = static_cast<float>(NumberValue);
+			if (TransitionNode->AutomaticRuleTriggerTime != NewValue)
+			{
+				ModifyTransition();
+				TransitionNode->AutomaticRuleTriggerTime = NewValue;
+			}
+		}
+		if (TransitionJson->TryGetNumberField(TEXT("min_time_before_reentry"), NumberValue))
+		{
+			const float NewValue = static_cast<float>(NumberValue);
+			if (TransitionNode->MinTimeBeforeReentry != NewValue)
+			{
+				ModifyTransition();
+				TransitionNode->MinTimeBeforeReentry = NewValue;
+			}
+		}
+
+		bool BoolValue = false;
+		if (TransitionJson->TryGetBoolField(TEXT("automatic_rule_based_on_sequence_player_in_state"), BoolValue))
+		{
+			if (TransitionNode->bAutomaticRuleBasedOnSequencePlayerInState != BoolValue)
+			{
+				ModifyTransition();
+				TransitionNode->bAutomaticRuleBasedOnSequencePlayerInState = BoolValue;
+			}
+		}
+		if (TransitionJson->TryGetBoolField(TEXT("bidirectional"), BoolValue))
+		{
+			if (TransitionNode->Bidirectional != BoolValue)
+			{
+				ModifyTransition();
+				TransitionNode->Bidirectional = BoolValue;
+			}
+		}
+		if (TransitionJson->TryGetBoolField(TEXT("disabled"), BoolValue))
+		{
+			if (TransitionNode->bDisabled != BoolValue)
+			{
+				ModifyTransition();
+				TransitionNode->bDisabled = BoolValue;
+			}
+		}
+
+		if (bTransitionChanged)
+		{
+			Context.AddChange(FString::Printf(TEXT("Updated anim transition %s"), *TransitionNode->GetStateName()));
+		}
+
+		TSharedPtr<FJsonObject> PropertiesJson;
+		if (TryGetObjectField(TransitionJson, TEXT("properties"), PropertiesJson))
+		{
+			ApplyPropertyMap(TransitionNode, PropertiesJson, FString::Printf(TEXT("anim transition %s"), *TransitionNode->GetStateName()), Context);
+		}
+	}
+
+	void ApplyTransitionGraphJson(UBlueprint* Blueprint, UAnimStateTransitionNode* TransitionNode, const TSharedPtr<FJsonObject>& TransitionJson, bool bAllowStructuralChanges, FJsonToAssetContext& Context)
+	{
+		if (!TransitionNode || !TransitionJson.IsValid() || !TransitionNode->BoundGraph)
+		{
+			return;
+		}
+
+		TSharedPtr<FJsonObject> TransitionGraphJson;
+		if (!TryGetObjectField(TransitionJson, TEXT("graph"), TransitionGraphJson))
+		{
+			return;
+		}
+
+		ApplyGraphNodes(Blueprint, TransitionNode->BoundGraph, TransitionGraphJson, bAllowStructuralChanges, Context);
+		ApplyGraphLinks(TransitionNode->BoundGraph, TransitionGraphJson, Context);
+	}
+
+	UAnimStateTransitionNode* CreateAnimTransitionNode(UAnimationStateMachineGraph* StateMachineGraph, const TSharedPtr<FJsonObject>& TransitionJson, FJsonToAssetContext& Context)
+	{
+		if (!StateMachineGraph || !TransitionJson.IsValid())
+		{
+			return nullptr;
+		}
+
+		FString FromStateName;
+		FString ToStateName;
+		TransitionJson->TryGetStringField(TEXT("from"), FromStateName);
+		TransitionJson->TryGetStringField(TEXT("to"), ToStateName);
+		if (FromStateName.IsEmpty())
+		{
+			TransitionJson->TryGetStringField(TEXT("previous_state"), FromStateName);
+		}
+		if (ToStateName.IsEmpty())
+		{
+			TransitionJson->TryGetStringField(TEXT("next_state"), ToStateName);
+		}
+
+		UAnimStateNode* FromState = FindAnimStateNode(StateMachineGraph, FromStateName);
+		UAnimStateNode* ToState = FindAnimStateNode(StateMachineGraph, ToStateName);
+		if (!FromState || !ToState)
+		{
+			Context.AddWarning(FString::Printf(TEXT("Transition endpoint not found in %s: %s -> %s"), *StateMachineGraph->GetName(), *FromStateName, *ToStateName));
+			return nullptr;
+		}
+
+		if (UAnimStateTransitionNode* ExistingTransition = FindAnimTransitionNode(StateMachineGraph, FromStateName, ToStateName))
+		{
+			ApplyTransitionJson(ExistingTransition, TransitionJson, Context);
+			return ExistingTransition;
+		}
+
+		StateMachineGraph->Modify();
+		UAnimStateTransitionNode* TransitionNode = NewObject<UAnimStateTransitionNode>(StateMachineGraph, UAnimStateTransitionNode::StaticClass(), NAME_None, RF_Transactional);
+		TransitionNode->CreateNewGuid();
+		ApplyNodePosition(TransitionNode, TransitionJson);
+		if (TransitionNode->NodePosX == 0 && TransitionNode->NodePosY == 0)
+		{
+			TransitionNode->NodePosX = (FromState->NodePosX + ToState->NodePosX) / 2;
+			TransitionNode->NodePosY = (FromState->NodePosY + ToState->NodePosY) / 2;
+		}
+
+		TransitionNode->AllocateDefaultPins();
+		StateMachineGraph->AddNode(TransitionNode, true, false);
+		TransitionNode->PostPlacedNewNode();
+		TransitionNode->CreateConnections(FromState, ToState);
+		ApplyTransitionJson(TransitionNode, TransitionJson, Context);
+
+		Context.AddChange(FString::Printf(TEXT("Created anim transition %s -> %s in state machine %s"), *FromStateName, *ToStateName, *StateMachineGraph->GetName()));
+		return TransitionNode;
+	}
+
+	void ApplyAnimationStateMachines(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Root, bool bAllowStructuralChanges, FJsonToAssetContext& Context)
+	{
+		if (!bAllowStructuralChanges)
+		{
+			return;
+		}
+
+		UAnimBlueprint* AnimBlueprint = Cast<UAnimBlueprint>(Blueprint);
+		if (!AnimBlueprint)
+		{
+			return;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* StateMachines = nullptr;
+		if (!Root->TryGetArrayField(TEXT("animation_state_machines"), StateMachines) || !StateMachines)
+		{
+			return;
+		}
+
+		for (const TSharedPtr<FJsonValue>& StateMachineValue : *StateMachines)
+		{
+			const TSharedPtr<FJsonObject>* StateMachineJson = nullptr;
+			if (!StateMachineValue.IsValid() || !StateMachineValue->TryGetObject(StateMachineJson) || !StateMachineJson || !StateMachineJson->IsValid())
+			{
+				continue;
+			}
+
+			FString StateMachineName;
+			(*StateMachineJson)->TryGetStringField(TEXT("name"), StateMachineName);
+			UAnimationStateMachineGraph* StateMachineGraph = FindAnimationStateMachineGraph(AnimBlueprint, StateMachineName);
+			if (!StateMachineGraph)
+			{
+				Context.AddWarning(FString::Printf(TEXT("Animation state machine not found: %s"), *StateMachineName));
+				continue;
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* Transitions = nullptr;
+			if ((*StateMachineJson)->TryGetArrayField(TEXT("transitions"), Transitions) && Transitions)
+			{
+				for (const TSharedPtr<FJsonValue>& TransitionValue : *Transitions)
+				{
+					const TSharedPtr<FJsonObject>* TransitionJson = nullptr;
+					if (TransitionValue.IsValid() && TransitionValue->TryGetObject(TransitionJson) && TransitionJson && TransitionJson->IsValid())
+					{
+						if (WantsDelete(*TransitionJson))
+						{
+							FString FromStateName;
+							FString ToStateName;
+							(*TransitionJson)->TryGetStringField(TEXT("from"), FromStateName);
+							(*TransitionJson)->TryGetStringField(TEXT("to"), ToStateName);
+							if (FromStateName.IsEmpty())
+							{
+								(*TransitionJson)->TryGetStringField(TEXT("previous_state"), FromStateName);
+							}
+							if (ToStateName.IsEmpty())
+							{
+								(*TransitionJson)->TryGetStringField(TEXT("next_state"), ToStateName);
+							}
+
+							if (UAnimStateTransitionNode* TransitionNode = FindAnimTransitionNode(StateMachineGraph, FromStateName, ToStateName))
+							{
+								DeleteAnimTransitionNode(StateMachineGraph, TransitionNode, Context);
+							}
+							else
+							{
+								Context.AddWarning(FString::Printf(TEXT("Anim transition delete target not found in %s: %s -> %s"), *StateMachineGraph->GetName(), *FromStateName, *ToStateName));
+							}
+						}
+					}
+				}
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* States = nullptr;
+			if ((*StateMachineJson)->TryGetArrayField(TEXT("states"), States) && States)
+			{
+				for (const TSharedPtr<FJsonValue>& StateValue : *States)
+				{
+					const TSharedPtr<FJsonObject>* StateJson = nullptr;
+					if (StateValue.IsValid() && StateValue->TryGetObject(StateJson) && StateJson && StateJson->IsValid())
+					{
+						FString StateName;
+						(*StateJson)->TryGetStringField(TEXT("name"), StateName);
+						if (WantsDelete(*StateJson))
+						{
+							if (UAnimStateNode* StateNode = FindAnimStateNode(StateMachineGraph, StateName))
+							{
+								DeleteAnimStateNode(StateMachineGraph, StateNode, Context);
+							}
+							else
+							{
+								Context.AddWarning(FString::Printf(TEXT("Anim state delete target not found in %s: %s"), *StateMachineGraph->GetName(), *StateName));
+							}
+						}
+						else
+						{
+							UAnimStateNode* StateNode = CreateAnimStateNode(StateMachineGraph, *StateJson, Context);
+							TSharedPtr<FJsonObject> StateGraphJson;
+							if (StateNode && StateNode->BoundGraph && TryGetObjectField(*StateJson, TEXT("graph"), StateGraphJson))
+							{
+								ApplyGraphNodes(Blueprint, StateNode->BoundGraph, StateGraphJson, bAllowStructuralChanges, Context);
+								ApplyGraphLinks(StateNode->BoundGraph, StateGraphJson, Context);
+							}
+						}
+					}
+				}
+			}
+
+			if (Transitions)
+			{
+				for (const TSharedPtr<FJsonValue>& TransitionValue : *Transitions)
+				{
+					const TSharedPtr<FJsonObject>* TransitionJson = nullptr;
+					if (TransitionValue.IsValid() && TransitionValue->TryGetObject(TransitionJson) && TransitionJson && TransitionJson->IsValid() && !WantsDelete(*TransitionJson))
+					{
+						UAnimStateTransitionNode* TransitionNode = CreateAnimTransitionNode(StateMachineGraph, *TransitionJson, Context);
+						ApplyTransitionGraphJson(Blueprint, TransitionNode, *TransitionJson, bAllowStructuralChanges, Context);
+					}
+				}
+			}
+		}
+	}
+
+	void ApplyGraphs(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Root, bool bApplyGraphChanges, bool bAllowStructuralChanges, FJsonToAssetContext& Context)
 	{
 		if (!bApplyGraphChanges)
 		{
@@ -762,15 +1663,48 @@ namespace
 			}
 
 			UEdGraph* Graph = FindGraphByJson(Blueprint, *GraphJson);
-			if (!Graph)
+			if (WantsDelete(*GraphJson))
 			{
-				FString GraphName;
-				(*GraphJson)->TryGetStringField(TEXT("name"), GraphName);
-				Context.AddWarning(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
+				if (!bAllowStructuralChanges)
+				{
+					Context.AddWarning(TEXT("Graph delete requested without structural changes enabled"));
+					continue;
+				}
+
+				if (Graph)
+				{
+					const FString GraphName = Graph->GetName();
+					Graph->Modify();
+					FBlueprintEditorUtils::RemoveGraph(Blueprint, Graph, EGraphRemoveFlags::Recompile);
+					Context.AddChange(FString::Printf(TEXT("Deleted graph %s"), *GraphName));
+				}
+				else
+				{
+					FString GraphName;
+					(*GraphJson)->TryGetStringField(TEXT("name"), GraphName);
+					Context.AddWarning(FString::Printf(TEXT("Graph delete target not found: %s"), *GraphName));
+				}
+
 				continue;
 			}
 
-			ApplyGraphNodes(Graph, *GraphJson, Context);
+			if (!Graph)
+			{
+				if (bAllowStructuralChanges)
+				{
+					Graph = CreateGraphFromJson(Blueprint, *GraphJson, Context);
+				}
+
+				if (!Graph)
+				{
+					FString GraphName;
+					(*GraphJson)->TryGetStringField(TEXT("name"), GraphName);
+					Context.AddWarning(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
+					continue;
+				}
+			}
+
+			ApplyGraphNodes(Blueprint, Graph, *GraphJson, bAllowStructuralChanges, Context);
 			ApplyGraphLinks(Graph, *GraphJson, Context);
 		}
 	}
@@ -812,6 +1746,7 @@ namespace
 	FString ApplyBlueprintJsonRoot(const TSharedPtr<FJsonObject>& Root, bool bSaveAsset, bool bCompileBlueprint, bool bApplyGraphChanges, bool bAllowStructuralChanges)
 	{
 		FJsonToAssetContext Context;
+		const bool bApplyStructuralGraphChanges = bApplyGraphChanges && bAllowStructuralChanges;
 		if (!Root.IsValid())
 		{
 			return MakeResultJson(false, TEXT("JSON root is invalid"), Context);
@@ -849,9 +1784,9 @@ namespace
 			return MakeResultJson(false, FString::Printf(TEXT("Asset is not a Blueprint or could not be loaded: %s"), *ObjectPathString), Context);
 		}
 
-		if (bAllowStructuralChanges)
+		if (bApplyStructuralGraphChanges)
 		{
-			Context.AddWarning(TEXT("Structural creation/deletion is not implemented in this MVP; existing objects are patched only."));
+			Context.AddWarning(TEXT("Structural changes are enabled. Node, graph, and AnimBP state-machine creation/deletion are supported."));
 		}
 
 		const FScopedTransaction Transaction(NSLOCTEXT("JsonToAsset", "ApplyBlueprintVisualScriptJson", "Apply Blueprint Visual Script JSON"));
@@ -877,11 +1812,22 @@ namespace
 			}
 		}
 
-		ApplyGraphs(Blueprint, Root, bApplyGraphChanges, Context);
+		if (bApplyGraphChanges)
+		{
+			ApplyAnimationStateMachines(Blueprint, Root, bApplyStructuralGraphChanges, Context);
+		}
+		ApplyGraphs(Blueprint, Root, bApplyGraphChanges, bApplyStructuralGraphChanges, Context);
 
 		if (Context.bAnyChange)
 		{
-			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			if (bApplyStructuralGraphChanges)
+			{
+				FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+			}
+			else
+			{
+				FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			}
 			Blueprint->GetOutermost()->MarkPackageDirty();
 
 			if (bCompileBlueprint)
